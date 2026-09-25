@@ -1,0 +1,12 @@
+{
+  "name": "Manhwa Recap Studio Cloud",
+  "short_name": "Recap Studio",
+  "description": "Serverless manhwa recap video studio backed by Google Drive.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#09090b",
+  "theme_color": "#09090b",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

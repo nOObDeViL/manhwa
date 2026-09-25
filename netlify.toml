@@ -1,0 +1,4 @@
+# Netlify auto-detects Next.js and installs its Next.js runtime (App Router + edge functions).
+[build]
+  command = "npm run build"
+  publish = ".next"
