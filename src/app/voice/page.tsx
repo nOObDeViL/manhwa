@@ -10,9 +10,11 @@ import { Project, patchProject } from '@/lib/projects';
 import { RecapScript } from '@/lib/script';
 import { useSession, useSettings } from '@/lib/store';
 import { CHUNK_LIMITS, TtsVoice, chunkText } from '@/lib/tts';
-import { listVoices, synthesize, ttsHint } from '@/lib/ttsClient';
+import { currentVoice, listVoices, synthesize, ttsHint } from '@/lib/ttsClient';
+import { GEMINI_STYLE_PRESETS, GEMINI_VOICES } from '@/lib/gemini';
+import type { TtsProvider } from '@/lib/store';
 import { cn, errorMessage, fileSlug, formatDuration, pool, stamp } from '@/lib/utils';
-import { Badge, Button, Card, Field, Notice, PageHeader, Progress, Select, Slider, Toggle } from '@/components/ui';
+import { Badge, Button, Card, Field, Input, Notice, PageHeader, Progress, Select, Slider, Textarea, Toggle } from '@/components/ui';
 import RequireProject from '@/components/RequireProject';
 import DrivePicker from '@/components/DrivePicker';
 
@@ -32,6 +34,7 @@ type Status = 'idle' | 'working' | 'done' | 'error';
 interface BeatAudio {
   status: Status;
   error?: string;
+  note?: string;
   chunks: Float32Array[] | null;
 }
 
@@ -56,7 +59,8 @@ function VoiceStudio({ project }: { project: Project }) {
   const cancelled = useRef(false);
 
   const provider = settings.ttsProvider;
-  const voice = provider === 'elevenlabs' ? settings.elevenVoiceId : settings.googleTtsVoice;
+  const voice = currentVoice();
+  const [previewing, setPreviewing] = useState(false);
   const limit = CHUNK_LIMITS[provider];
 
   const beats = useMemo(
@@ -73,7 +77,12 @@ function VoiceStudio({ project }: { project: Project }) {
       return null;
     });
     setSavedName(null);
-  }, [beats, provider, voice, settings.speakingRate]);
+  }, [beats, provider, voice, settings.speakingRate, settings.geminiTtsStyle, settings.googlePitch, settings.elevenStability, settings.elevenSimilarity, settings.elevenStyle]);
+
+  // Voice list for the active provider (Gemini's is built in).
+  useEffect(() => {
+    setVoices(provider === 'gemini' ? GEMINI_VOICES.map((v) => ({ id: v.id, name: v.id, detail: v.detail })) : null);
+  }, [provider]);
 
   // Load the active script if the Script page hasn't already.
   useEffect(() => {
@@ -95,20 +104,14 @@ function VoiceStudio({ project }: { project: Project }) {
       const chunks: Float32Array[] = [];
       for (const text of beats[i].chunks) {
         if (cancelled.current) throw new Error('Stopped');
-        const mp3 = await synthesize({
-          provider,
-          text,
-          voice,
-          modelId: provider === 'elevenlabs' ? settings.elevenModelId : undefined,
-          speakingRate: settings.speakingRate,
-        });
+        const mp3 = await synthesize(text, (note) => patchBeat(i, { note }));
         chunks.push(await decodeToMono(mp3));
       }
-      patchBeat(i, { status: 'done', chunks });
+      patchBeat(i, { status: 'done', chunks, note: undefined });
     } catch (err) {
       const msg = errorMessage(err);
       const hint = ttsHint(msg);
-      patchBeat(i, { status: 'error', error: hint ? `${msg}\n${hint}` : msg });
+      patchBeat(i, { status: 'error', note: undefined, error: hint ? `${msg}\n${hint}` : msg });
     }
   };
 
@@ -120,7 +123,8 @@ function VoiceStudio({ project }: { project: Project }) {
     cancelled.current = false;
     setRunning(true);
     const todo = beats.map((_, i) => i).filter((i) => audio[i]?.status !== 'done');
-    await pool(todo, 2, async (i) => {
+    // Gemini's free tier is rate-limited per minute, so voice one beat at a time there.
+    await pool(todo, provider === 'gemini' ? 1 : 2, async (i) => {
       if (!cancelled.current) await synthBeat(i);
     });
     setRunning(false);
@@ -207,7 +211,26 @@ function VoiceStudio({ project }: { project: Project }) {
   };
 
   const setVoice = (id: string) =>
-    settings.update(provider === 'elevenlabs' ? { elevenVoiceId: id } : { googleTtsVoice: id });
+    settings.update(provider === 'elevenlabs' ? { elevenVoiceId: id } : provider === 'google' ? { googleTtsVoice: id } : { geminiTtsVoice: id });
+
+  const previewVoice = async () => {
+    setPreviewing(true);
+    try {
+      const sample = beats[0]?.text.split(/(?<=[.!?])\s/).slice(0, 2).join(' ') || 'This is how your recap narration will sound.';
+      const data = await synthesize(sample.slice(0, 300));
+      const url = URL.createObjectURL(encodeWav(await decodeToMono(data)));
+      player.current?.pause();
+      const el = new Audio(url);
+      player.current = el;
+      el.onended = () => URL.revokeObjectURL(url);
+      await el.play().catch(() => undefined);
+    } catch (err) {
+      const msg = errorMessage(err);
+      toast(ttsHint(msg) ?? msg, 'error');
+    } finally {
+      setPreviewing(false);
+    }
+  };
 
   const loadScript = async (files: DriveFile[]) => {
     try {
@@ -242,9 +265,16 @@ function VoiceStudio({ project }: { project: Project }) {
   return (
     <div className="grid gap-4 xl:grid-cols-[360px_1fr]">
       <div className="space-y-4">
-        <Card title="Voice" subtitle={`${provider === 'elevenlabs' ? 'ElevenLabs' : 'Google Cloud TTS'} · ${settings.ttsTransport === 'edge' ? 'via edge function' : 'direct from browser'}`}>
+        <Card title="Voice" subtitle={provider === 'gemini' ? 'Gemini voices · free with your Google API key' : `${provider === 'elevenlabs' ? 'ElevenLabs' : 'Google Cloud TTS'} · ${settings.ttsTransport === 'edge' ? 'via edge function' : 'direct from browser'}`}>
           <div className="space-y-4">
-            <Field label="Voice" hint={<>Change provider, keys and transport in <Link href="/settings" className="underline">Settings</Link>.</>}>
+            <Field label="Voice provider">
+              <Select value={provider} onChange={(e) => settings.update({ ttsProvider: e.target.value as TtsProvider })}>
+                <option value="gemini">Gemini — free human-like voices (uses your Google key)</option>
+                <option value="elevenlabs">ElevenLabs — premium, 10k chars/month free</option>
+                <option value="google">Google Cloud TTS — needs billing linked</option>
+              </Select>
+            </Field>
+            <Field label="Voice" hint={provider === 'gemini' ? '30 natural voices. Charon, Fenrir and Algenib suit dramatic recaps.' : <>Keys and transport are on the <Link href="/settings" className="underline">Settings</Link> page.</>}>
               {voices ? (
                 <Select value={voice} onChange={(e) => setVoice(e.target.value)}>
                   {!voices.some((v) => v.id === voice) && <option value={voice}>{voice}</option>}
@@ -264,15 +294,63 @@ function VoiceStudio({ project }: { project: Project }) {
                 </div>
               )}
             </Field>
-            <Slider
-              label="Speaking rate"
-              value={settings.speakingRate}
-              min={provider === 'elevenlabs' ? 0.7 : 0.5}
-              max={provider === 'elevenlabs' ? 1.2 : 2}
-              step={0.05}
-              onChange={(v) => settings.update({ speakingRate: v })}
-              format={(v) => `${v.toFixed(2)}×`}
-            />
+            <Button className="w-full" onClick={previewVoice} loading={previewing} icon={<Play className="size-4" />}>
+              Preview this voice
+            </Button>
+
+            {provider === 'gemini' && (
+              <>
+                <Field label="Delivery style" hint="Tells the voice how to perform. Pick a preset or write your own.">
+                  <Select
+                    value={GEMINI_STYLE_PRESETS.some((p) => p.value === settings.geminiTtsStyle) ? settings.geminiTtsStyle : '__custom'}
+                    onChange={(e) => e.target.value !== '__custom' && settings.update({ geminiTtsStyle: e.target.value })}
+                  >
+                    {GEMINI_STYLE_PRESETS.map((p) => (
+                      <option key={p.label} value={p.value}>
+                        {p.label}
+                      </option>
+                    ))}
+                    <option value="__custom">Custom…</option>
+                  </Select>
+                </Field>
+                <Textarea rows={2} value={settings.geminiTtsStyle} onChange={(e) => settings.update({ geminiTtsStyle: e.target.value })} placeholder="e.g. Speak slowly with a deep, mysterious tone" />
+                <Field label="TTS model" hint="Auto picks whichever Gemini TTS model still has free quota.">
+                  <Input value={settings.geminiTtsModel} onChange={(e) => settings.update({ geminiTtsModel: e.target.value.trim() || 'auto' })} />
+                </Field>
+                {!settings.geminiApiKey && <Notice kind="warn">Add your Gemini API key in <Link href="/settings" className="underline">Settings</Link>.</Notice>}
+              </>
+            )}
+
+            {provider === 'elevenlabs' && (
+              <>
+                <Field label="Model">
+                  <Select value={settings.elevenModelId} onChange={(e) => settings.update({ elevenModelId: e.target.value })}>
+                    <option value="eleven_multilingual_v2">Multilingual v2 (most natural)</option>
+                    <option value="eleven_flash_v2_5">Flash v2.5 (half the credits)</option>
+                    <option value="eleven_turbo_v2_5">Turbo v2.5</option>
+                  </Select>
+                </Field>
+                <Slider label="Stability" value={settings.elevenStability} min={0} max={1} step={0.05} onChange={(v) => settings.update({ elevenStability: v })} format={(v) => v.toFixed(2)} hint="Lower = more emotional and varied, higher = steadier." />
+                <Slider label="Similarity" value={settings.elevenSimilarity} min={0} max={1} step={0.05} onChange={(v) => settings.update({ elevenSimilarity: v })} format={(v) => v.toFixed(2)} />
+                <Slider label="Style exaggeration" value={settings.elevenStyle} min={0} max={1} step={0.05} onChange={(v) => settings.update({ elevenStyle: v })} format={(v) => v.toFixed(2)} />
+                <Toggle checked={settings.elevenSpeakerBoost} onChange={(v) => settings.update({ elevenSpeakerBoost: v })} label="Speaker boost" />
+              </>
+            )}
+
+            {provider !== 'gemini' && (
+              <Slider
+                label="Speaking rate"
+                value={settings.speakingRate}
+                min={provider === 'elevenlabs' ? 0.7 : 0.5}
+                max={provider === 'elevenlabs' ? 1.2 : 2}
+                step={0.05}
+                onChange={(v) => settings.update({ speakingRate: v })}
+                format={(v) => `${v.toFixed(2)}×`}
+              />
+            )}
+            {provider === 'google' && (
+              <Slider label="Pitch" value={settings.googlePitch} min={-10} max={10} step={0.5} onChange={(v) => settings.update({ googlePitch: v })} format={(v) => `${v > 0 ? '+' : ''}${v} st`} hint="Not supported by Chirp 3 HD voices." />
+            )}
             <Slider label="Pause between beats" value={gap} min={0} max={1.5} step={0.05} onChange={setGap} format={(v) => `${v.toFixed(2)}s`} />
             <Toggle checked={normalize} onChange={setNormalize} label="Normalize loudness (peak −1 dB)" />
             <div className="rounded-xl bg-zinc-950/60 p-3 text-xs text-zinc-400">
@@ -368,6 +446,7 @@ function VoiceStudio({ project }: { project: Project }) {
                     </div>
                   </div>
                 </div>
+                {a?.note && a.status === 'working' && <p className="mt-2 text-xs text-violet-300">{a.note}</p>}
                 {a?.error && <p className="mt-2 whitespace-pre-line text-xs text-red-300">{a.error}</p>}
               </li>
             );

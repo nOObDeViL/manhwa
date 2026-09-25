@@ -104,13 +104,20 @@ function ScriptStudio({ project }: { project: Project }) {
         includeOutro,
         images,
       };
-      setStage(`Writing with ${engine === 'gemini' ? settings.geminiModel : settings.openaiModel}…`);
+      setStage(engine === 'gemini' ? 'Finding the best available Gemini model…' : `Writing with ${settings.openaiModel}…`);
       const result =
         engine === 'gemini'
-          ? await generateWithGemini(req, settings.geminiApiKey, settings.geminiModel)
+          ? await generateWithGemini(
+              req,
+              settings.geminiApiKey,
+              settings.geminiModel,
+              setStage,
+              (m) => m !== settings.geminiLastGood && settings.update({ geminiLastGood: m }),
+              settings.geminiLastGood,
+            )
           : await generateWithOpenAI(req, settings.openaiBaseUrl, settings.openaiApiKey, settings.openaiModel);
       setSession({ script: result, scriptFileId: null });
-      toast(`Script ready: ${result.beats.length} beats.`, 'success');
+      toast(`Script ready: ${result.beats.length} beats (${result.model}).`, 'success');
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -203,7 +210,7 @@ function ScriptStudio({ project }: { project: Project }) {
             </div>
             <Field label="Engine">
               <Select value={engine} onChange={(e) => setEngine(e.target.value as ScriptEngine)}>
-                <option value="gemini">Google Gemini ({settings.geminiModel})</option>
+                <option value="gemini">Google Gemini ({settings.geminiModel === 'auto' ? `auto${settings.geminiLastGood ? ` · last: ${settings.geminiLastGood}` : ''}` : settings.geminiModel})</option>
                 <option value="openai">OpenAI-compatible ({settings.openaiModel})</option>
               </Select>
             </Field>

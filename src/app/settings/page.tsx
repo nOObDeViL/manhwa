@@ -49,7 +49,7 @@ export default function SettingsPage() {
   };
 
   const envAccount = Boolean(process.env.NEXT_PUBLIC_DRIVE_ACCOUNT);
-  const serverKey = server?.[s.ttsProvider];
+  const serverKey = s.ttsProvider === 'gemini' ? false : server?.[s.ttsProvider];
 
   return (
     <div>
@@ -109,17 +109,18 @@ export default function SettingsPage() {
             <Field label="Gemini API key" hint="Free: aistudio.google.com → Get API key.">
               <Secret value={s.geminiApiKey} onChange={(v) => s.update({ geminiApiKey: v })} placeholder="AIza…" />
             </Field>
-            <Field label="Gemini model" hint="Model names change over time — use “List models” to see what your key can use.">
+            <Field label="Gemini model" hint="Auto tries free-tier models your key can use and switches when one runs out of quota. Pro models usually have no free quota.">
               <div className="flex gap-2">
                 {models?.length ? (
                   <Select value={s.geminiModel} onChange={(e) => s.update({ geminiModel: e.target.value })}>
-                    {!models.includes(s.geminiModel) && <option value={s.geminiModel}>{s.geminiModel}</option>}
+                    <option value="auto">Auto (best available)</option>
+                    {s.geminiModel !== 'auto' && !models.includes(s.geminiModel) && <option value={s.geminiModel}>{s.geminiModel}</option>}
                     {models.map((m) => (
                       <option key={m}>{m}</option>
                     ))}
                   </Select>
                 ) : (
-                  <Input value={s.geminiModel} onChange={(e) => s.update({ geminiModel: e.target.value.trim() })} />
+                  <Input value={s.geminiModel} onChange={(e) => s.update({ geminiModel: e.target.value.trim() || 'auto' })} placeholder="auto" />
                 )}
                 <Button onClick={fetchModels} loading={modelsLoading} disabled={!s.geminiApiKey} icon={<List className="size-4" />}>
                   List models
@@ -149,6 +150,7 @@ export default function SettingsPage() {
             <div className="grid grid-cols-2 gap-3">
               <Field label="Provider">
                 <Select value={s.ttsProvider} onChange={(e) => s.update({ ttsProvider: e.target.value as TtsProvider })}>
+                  <option value="gemini">Gemini (free, uses Gemini key)</option>
                   <option value="elevenlabs">ElevenLabs</option>
                   <option value="google">Google Cloud TTS</option>
                 </Select>
@@ -171,7 +173,9 @@ export default function SettingsPage() {
                 )}
               </div>
             )}
-            {s.ttsProvider === 'elevenlabs' ? (
+            {s.ttsProvider === 'gemini' ? (
+              <Notice kind="success">Gemini voices use the Gemini API key above — nothing else to set up. Pick a voice and delivery style on the Voice page.</Notice>
+            ) : s.ttsProvider === 'elevenlabs' ? (
               <>
                 <Field label="ElevenLabs API key" hint={serverKey && s.ttsTransport === 'edge' ? 'Optional — the server key will be used if empty.' : 'elevenlabs.io → Profile → API keys.'}>
                   <Secret value={s.elevenApiKey} onChange={(v) => s.update({ elevenApiKey: v })} />
