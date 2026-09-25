@@ -1,317 +1,166 @@
 /**
- * Recap script generation — two engines, both called straight from the browser:
- *   1. Google Gemini via @google/genai (free tier key from aistudio.google.com)
- *   2. Any OpenAI-compatible endpoint (Groq, OpenRouter, …) as a fallback
+ * Provider calls for ElevenLabs and Google Cloud Text-to-Speech.
+ * Pure `fetch` — shared by the browser ("direct" transport) and the /api/tts edge function.
+ * Must not import anything browser-only.
  */
 
-export interface Beat {
-  n: number;
-  title?: string;
-  narration: string;
-  visual?: string;
-  seconds?: number;
+/** Providers reachable via the edge function. Gemini TTS runs in the browser (see gemini.ts). */
+export type TtsProviderId = 'elevenlabs' | 'google';
+
+export interface TtsRequest {
+  provider: TtsProviderId;
+  text: string;
+  voice: string;
+  modelId?: string;
+  speakingRate?: number;
+  /** Google: semitones −20…20 */
+  pitch?: number;
+  /** ElevenLabs voice settings */
+  stability?: number;
+  similarity?: number;
+  style?: number;
+  speakerBoost?: boolean;
 }
 
-export interface RecapScript {
-  app: 'manhwa-recap-studio';
-  version: 1;
-  title: string;
-  series?: string;
-  chapter?: string;
-  tone: string;
-  language: string;
-  targetSeconds: number;
-  engine: string;
-  model: string;
-  createdAt: string;
-  beats: Beat[];
+export interface TtsVoice {
+  id: string;
+  name: string;
+  detail?: string;
 }
 
-export const TONES = [
-  'Dramatic & cinematic',
-  'Hype / high energy',
-  'Dark & suspenseful',
-  'Comedic & sarcastic',
-  'Casual storyteller',
-  'Wholesome & emotional',
-  'Epic narrator (trailer voice)',
-];
-
-export const LENGTH_PRESETS = [
-  { seconds: 60, label: '1 min (Short)' },
-  { seconds: 180, label: '3 min' },
-  { seconds: 300, label: '5 min' },
-  { seconds: 480, label: '8 min' },
-  { seconds: 600, label: '10 min' },
-  { seconds: 900, label: '15 min' },
-];
-
-/** ~150 spoken words per minute is a comfortable recap pace. */
-export const WORDS_PER_SECOND = 2.5;
-
-export function wordCount(text: string): number {
-  return text.trim() ? text.trim().split(/\s+/).length : 0;
-}
-
-export function estimateSeconds(text: string): number {
-  return Math.max(1, Math.round(wordCount(text) / WORDS_PER_SECOND));
-}
-
-export function totalSeconds(script: Pick<RecapScript, 'beats'>): number {
-  return script.beats.reduce((sum, b) => sum + estimateSeconds(b.narration), 0);
-}
-
-export interface ScriptRequest {
-  series?: string;
-  synopsis?: string;
-  chapter?: string;
-  sourceText: string;
-  targetSeconds: number;
-  tone: string;
-  language: string;
-  includeOutro: boolean;
-  /** Base64 panel images (Gemini only), in reading order. */
-  images?: Array<{ mimeType: string; data: string }>;
-}
-
-export function buildPrompt(req: ScriptRequest) {
-  const beatCount = Math.min(60, Math.max(4, Math.round(req.targetSeconds / 12)));
-  const words = Math.round(req.targetSeconds * WORDS_PER_SECOND);
-
-  const system = [
-    'You are a top YouTube manhwa recap scriptwriter.',
-    'You turn chapter content into a gripping, spoiler-heavy narrated recap that a text-to-speech voice will read aloud.',
-    'Rules:',
-    '- Narration is plain spoken prose: no markdown, no emojis, no stage directions, no speaker labels, no bracketed notes.',
-    '- Third person, present tense, vivid but clear. Use character names consistently.',
-    '- Beat 1 is a hook that makes viewers stay. Beats follow the story in chronological order.',
-    '- Each beat is 1–4 sentences and matches one moment/panel group of the chapter.',
-    '- "visual" briefly describes which panel or scene should be on screen for that beat.',
-    '- "seconds" is your estimate of how long the narration takes to read aloud.',
-    req.includeOutro
-      ? '- The final beat is a short outro teasing what comes next and asking viewers to like and subscribe.'
-      : '- Do not add a call-to-action outro.',
-    '- Respond with JSON only, matching the requested schema.',
-  ].join('\n');
-
-  const user = [
-    req.series ? `Series: ${req.series}` : null,
-    req.chapter ? `Chapter / arc: ${req.chapter}` : null,
-    req.synopsis ? `Series synopsis (background only, do not recap it):\n${req.synopsis}` : null,
-    `Tone: ${req.tone}`,
-    `Narration language: ${req.language}`,
-    `Target video length: ${req.targetSeconds} seconds (about ${words} words total, roughly ${beatCount} beats).`,
-    req.images?.length
-      ? `${req.images.length} panel images are attached in reading order. Use them to understand what happens and reference them in "visual".`
-      : null,
-    req.sourceText.trim() ? `Chapter content / summary / raw text:\n"""\n${req.sourceText.trim()}\n"""` : null,
-    '',
-    'Return JSON: {"title": string, "beats": [{"n": number, "title": string, "narration": string, "visual": string, "seconds": number}]}',
-  ]
-    .filter((line) => line !== null)
-    .join('\n\n');
-
-  return { system, user, beatCount, words };
-}
-
-function parseLooseJson(text: string): unknown {
-  const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    const start = cleaned.indexOf('{');
-    const end = cleaned.lastIndexOf('}');
-    if (start >= 0 && end > start) return JSON.parse(cleaned.slice(start, end + 1));
-    throw new Error('The model did not return valid JSON. Try again or pick a different model.');
+export class TtsError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'TtsError';
+    this.status = status;
   }
 }
 
-export function normalizeScript(raw: unknown, req: ScriptRequest, engine: string, model: string): RecapScript {
-  const obj = (raw ?? {}) as { title?: unknown; beats?: unknown };
-  const beatsIn = Array.isArray(obj.beats) ? obj.beats : [];
-  const beats: Beat[] = beatsIn
-    .map((b) => (b ?? {}) as Record<string, unknown>)
-    .map((b) => ({
-      n: 0,
-      title: typeof b.title === 'string' ? b.title.trim() : undefined,
-      narration: String(b.narration ?? b.text ?? '').trim(),
-      visual: typeof b.visual === 'string' ? b.visual.trim() : undefined,
-    }))
-    .filter((b) => b.narration)
-    .map((b, i) => ({ ...b, n: i + 1, seconds: estimateSeconds(b.narration) }));
-  if (!beats.length) throw new Error('The model returned no usable beats. Add more chapter content and try again.');
-  return {
-    app: 'manhwa-recap-studio',
-    version: 1,
-    title: typeof obj.title === 'string' && obj.title.trim() ? obj.title.trim() : `${req.series ?? 'Manhwa'} recap`,
-    series: req.series,
-    chapter: req.chapter,
-    tone: req.tone,
-    language: req.language,
-    targetSeconds: req.targetSeconds,
-    engine,
-    model,
-    createdAt: new Date().toISOString(),
-    beats,
-  };
+/** Characters per request. Google's hard limit is 5000 *bytes*; we check bytes separately. */
+export const CHUNK_LIMITS: Record<TtsProviderId | 'gemini', number> = { elevenlabs: 2400, google: 4000, gemini: 2500 };
+
+export const MAX_TEXT_LENGTH = 5000;
+
+async function readError(res: Response): Promise<string> {
+  const text = await res.text().catch(() => '');
+  try {
+    const j = JSON.parse(text);
+    const detail = j.detail;
+    if (typeof detail === 'string') return detail;
+    if (detail?.message) return detail.message;
+    if (j.error?.message) return j.error.message;
+  } catch {
+    /* not JSON */
+  }
+  return text.slice(0, 300) || res.statusText;
 }
 
-export async function generateWithGemini(
-  req: ScriptRequest,
-  apiKey: string,
-  model: string,
-  onStatus?: (message: string) => void,
-): Promise<RecapScript> {
-  if (!apiKey) throw new Error('Add your Gemini API key on the Settings page (free at aistudio.google.com).');
-  const { GoogleGenAI, Type } = await import('@google/genai');
-  const ai = new GoogleGenAI({ apiKey });
-  const { system, user } = buildPrompt(req);
+function base64ToArrayBuffer(b64: string): ArrayBuffer {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
 
-  const parts: Array<Record<string, unknown>> = [{ text: user }];
-  for (const img of req.images ?? []) parts.push({ inlineData: { mimeType: img.mimeType, data: img.data } });
+export async function synthesizeWithKey(req: TtsRequest, apiKey: string): Promise<ArrayBuffer> {
+  if (!apiKey) throw new TtsError('Missing TTS API key.', 400);
+  const rate = req.speakingRate ?? 1;
 
-  // Busy/rate-limited (503/429): retry with backoff, then fall back to lighter models.
-  const candidates = [model, ...GEMINI_FALLBACKS.filter((m) => m !== model)];
-  let lastErr: unknown;
-  for (const m of candidates) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        onStatus?.(m === model ? (attempt ? `Gemini is busy — retry ${attempt}/2…` : `Writing with ${m}…`) : `Busy — trying ${m}…`);
-        return await callGemini(ai, Type, m, system, parts);
-      } catch (err) {
-        lastErr = err;
-        if (!isBusyError(err)) throw friendlyGeminiError(err);
-        if (attempt < 2) await new Promise((r) => setTimeout(r, 2000 * 2 ** attempt));
-      }
+  if (req.provider === 'elevenlabs') {
+    const res = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(req.voice)}?output_format=mp3_44100_128`,
+      {
+        method: 'POST',
+        headers: { 'xi-api-key': apiKey, 'Content-Type': 'application/json', Accept: 'audio/mpeg' },
+        body: JSON.stringify({
+          text: req.text,
+          model_id: req.modelId || 'eleven_multilingual_v2',
+          voice_settings: {
+            stability: req.stability ?? 0.45,
+            similarity_boost: req.similarity ?? 0.8,
+            style: req.style ?? 0,
+            use_speaker_boost: req.speakerBoost ?? true,
+            speed: Math.min(1.2, Math.max(0.7, rate)),
+          },
+        }),
+      },
+    );
+    if (!res.ok) throw new TtsError(`ElevenLabs: ${await readError(res)}`, res.status);
+    return res.arrayBuffer();
+  }
+
+  const languageCode = req.voice.split('-').slice(0, 2).join('-') || 'en-US';
+  const audioConfig: Record<string, unknown> = { audioEncoding: 'MP3' };
+  if (rate !== 1) audioConfig.speakingRate = rate;
+  if (req.pitch) audioConfig.pitch = req.pitch;
+  const res = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${encodeURIComponent(apiKey)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ input: { text: req.text }, voice: { languageCode, name: req.voice }, audioConfig }),
+  });
+  if (!res.ok) throw new TtsError(`Google TTS: ${await readError(res)}`, res.status);
+  const json = (await res.json()) as { audioContent?: string };
+  if (!json.audioContent) throw new TtsError('Google TTS returned no audio.', 502);
+  return base64ToArrayBuffer(json.audioContent);
+}
+
+export async function listVoicesWithKey(provider: TtsProviderId, apiKey: string, languageCode = 'en-US'): Promise<TtsVoice[]> {
+  if (!apiKey) throw new TtsError('Missing TTS API key.', 400);
+  if (provider === 'elevenlabs') {
+    const res = await fetch('https://api.elevenlabs.io/v1/voices', { headers: { 'xi-api-key': apiKey } });
+    if (!res.ok) throw new TtsError(`ElevenLabs: ${await readError(res)}`, res.status);
+    const json = (await res.json()) as {
+      voices?: Array<{ voice_id: string; name: string; category?: string; labels?: Record<string, string> }>;
+    };
+    return (json.voices ?? []).map((v) => ({
+      id: v.voice_id,
+      name: v.name,
+      detail: [v.category, v.labels?.accent, v.labels?.gender, v.labels?.age].filter(Boolean).join(' · '),
+    }));
+  }
+  const res = await fetch(
+    `https://texttospeech.googleapis.com/v1/voices?languageCode=${encodeURIComponent(languageCode)}&key=${encodeURIComponent(apiKey)}`,
+  );
+  if (!res.ok) throw new TtsError(`Google TTS: ${await readError(res)}`, res.status);
+  const json = (await res.json()) as { voices?: Array<{ name: string; ssmlGender?: string; languageCodes?: string[] }> };
+  return (json.voices ?? [])
+    .map((v) => ({ id: v.name, name: v.name, detail: [v.ssmlGender?.toLowerCase(), v.languageCodes?.join(', ')].filter(Boolean).join(' · ') }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+const byteLength = (s: string) => new TextEncoder().encode(s).length;
+
+/** Split text into provider-sized chunks on sentence (then word) boundaries. */
+export function chunkText(text: string, maxChars: number): string[] {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (!clean) return [];
+  const fits = (s: string) => s.length <= maxChars && byteLength(s) <= 4800;
+  if (fits(clean)) return [clean];
+
+  const sentences = clean.match(/[^.!?…。！？]+[.!?…。！？]+["'”’)\]]*\s*|[^.!?…。！？]+$/g) ?? [clean];
+  const chunks: string[] = [];
+  let current = '';
+  const push = () => {
+    if (current.trim()) chunks.push(current.trim());
+    current = '';
+  };
+  for (const sentence of sentences) {
+    if (fits(current + sentence)) {
+      current += sentence;
+      continue;
+    }
+    push();
+    if (fits(sentence)) {
+      current = sentence;
+      continue;
+    }
+    // A single enormous sentence: fall back to word boundaries.
+    for (const word of sentence.split(' ')) {
+      if (!fits(current + ' ' + word)) push();
+      current += (current ? ' ' : '') + word;
     }
   }
-  throw friendlyGeminiError(lastErr);
-
-  async function callGemini(ai: InstanceType<typeof GoogleGenAI>, T: typeof Type, m: string, sys: string, p: Array<Record<string, unknown>>) {
-    const script = await generateOnce(ai, T, m, sys, p);
-    return normalizeScript(parseLooseJson(script), req, 'gemini', m);
-  }
-}
-
-const GEMINI_FALLBACKS = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash'];
-
-function isBusyError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /\b(503|429|500)\b|UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand/i.test(msg);
-}
-
-function friendlyGeminiError(err: unknown): Error {
-  const msg = err instanceof Error ? err.message : String(err);
-  if (/UNAVAILABLE|high demand|overloaded|503/i.test(msg))
-    return new Error('Gemini’s free models are overloaded right now. Wait a minute and try again, or switch engine to OpenAI-compatible (Groq) in Settings.');
-  if (/RESOURCE_EXHAUSTED|429|quota/i.test(msg))
-    return new Error('Gemini free-tier rate limit reached. Wait a minute (or until tomorrow for the daily limit), or use the Groq engine.');
-  if (/API key not valid|API_KEY_INVALID/i.test(msg)) return new Error('Your Gemini API key is invalid — check it in Settings.');
-  if (/not found|NOT_FOUND/i.test(msg)) return new Error('That Gemini model is not available to your key. Settings → List models.');
-  return err instanceof Error ? err : new Error(msg);
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function generateOnce(ai: any, Type: any, model: string, system: string, parts: Array<Record<string, unknown>>): Promise<string> {
-  const response = await ai.models.generateContent({
-    model,
-    contents: [{ role: 'user', parts }],
-    config: {
-      systemInstruction: system,
-      temperature: 0.9,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          title: { type: Type.STRING },
-          beats: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                n: { type: Type.INTEGER },
-                title: { type: Type.STRING },
-                narration: { type: Type.STRING },
-                visual: { type: Type.STRING },
-                seconds: { type: Type.NUMBER },
-              },
-              required: ['n', 'narration'],
-            },
-          },
-        },
-        required: ['title', 'beats'],
-      },
-    },
-  });
-  const text = response.text;
-  if (!text) throw new Error('Gemini returned an empty response (it may have been blocked by safety filters).');
-  return text;
-}
-
-export async function listGeminiModels(apiKey: string): Promise<string[]> {
-  const { GoogleGenAI } = await import('@google/genai');
-  const ai = new GoogleGenAI({ apiKey });
-  const pager = await ai.models.list({ config: { pageSize: 100 } });
-  const names: string[] = [];
-  for await (const m of pager) {
-    const name = (m.name ?? '').replace(/^models\//, '');
-    const actions = (m as { supportedActions?: string[] }).supportedActions;
-    if (name.startsWith('gemini') && (!actions || actions.includes('generateContent'))) names.push(name);
-  }
-  return names.sort();
-}
-
-export async function generateWithOpenAI(req: ScriptRequest, baseUrl: string, apiKey: string, model: string): Promise<RecapScript> {
-  if (!apiKey) throw new Error('Add an API key for the OpenAI-compatible engine on the Settings page.');
-  const { system, user } = buildPrompt({ ...req, images: undefined });
-  const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model,
-      temperature: 0.9,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-    }),
-  });
-  const json = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(`Script engine error (${res.status}): ${json?.error?.message || res.statusText}`);
-  const content = json?.choices?.[0]?.message?.content;
-  if (!content) throw new Error('The engine returned an empty response.');
-  return normalizeScript(parseLooseJson(content), req, 'openai-compatible', model);
-}
-
-export function scriptToText(script: RecapScript): string {
-  const lines = [
-    script.title,
-    [script.series, script.chapter].filter(Boolean).join(' — '),
-    `Tone: ${script.tone} | Target: ${Math.round(script.targetSeconds / 60)} min | Beats: ${script.beats.length} | Est. read: ${Math.round(
-      totalSeconds(script),
-    )}s`,
-    '',
-  ];
-  for (const b of script.beats) {
-    lines.push(`[${String(b.n).padStart(2, '0')}] ${b.title ?? ''} (~${estimateSeconds(b.narration)}s)`.trim());
-    lines.push(b.narration);
-    if (b.visual) lines.push(`    Visual: ${b.visual}`);
-    lines.push('');
-  }
-  return lines.filter((l, i) => !(i === 1 && !l)).join('\n');
-}
-
-/** Downscale panel images for multimodal prompts to keep requests small. */
-export async function blobToPromptImage(blob: Blob, maxSide = 768): Promise<{ mimeType: string; data: string }> {
-  const bmp = await createImageBitmap(blob);
-  const scale = Math.min(1, maxSide / Math.max(bmp.width, bmp.height));
-  const canvas = document.createElement('canvas');
-  canvas.width = Math.max(1, Math.round(bmp.width * scale));
-  canvas.height = Math.max(1, Math.round(bmp.height * scale));
-  canvas.getContext('2d')!.drawImage(bmp, 0, 0, canvas.width, canvas.height);
-  bmp.close();
-  const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
-  canvas.width = canvas.height = 0;
-  return { mimeType: 'image/jpeg', data: dataUrl.split(',')[1] };
+  push();
+  return chunks;
 }
