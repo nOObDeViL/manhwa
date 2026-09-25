@@ -8,7 +8,7 @@ import type { RecapScript } from './script';
 /* ------------------------------------------------------------------ */
 
 export type ScriptEngine = 'gemini' | 'openai';
-export type TtsProvider = 'elevenlabs' | 'google';
+export type TtsProvider = 'gemini' | 'elevenlabs' | 'google';
 export type TtsTransport = 'edge' | 'direct';
 
 export interface Settings {
@@ -18,7 +18,9 @@ export interface Settings {
 
   scriptEngine: ScriptEngine;
   geminiApiKey: string;
+  /** 'auto' = pick the best model your key can use. */
   geminiModel: string;
+  geminiLastGood: string;
   openaiBaseUrl: string;
   openaiApiKey: string;
   openaiModel: string;
@@ -30,7 +32,18 @@ export interface Settings {
   elevenModelId: string;
   googleTtsApiKey: string;
   googleTtsVoice: string;
+  googlePitch: number;
   speakingRate: number;
+
+  geminiTtsVoice: string;
+  geminiTtsStyle: string;
+  geminiTtsModel: string;
+  geminiTtsLastGood: string;
+
+  elevenStability: number;
+  elevenSimilarity: number;
+  elevenStyle: number;
+  elevenSpeakerBoost: boolean;
 
   lastProjectId: string;
 }
@@ -41,19 +54,31 @@ export const DEFAULT_SETTINGS: Settings = {
 
   scriptEngine: 'gemini',
   geminiApiKey: '',
-  geminiModel: 'gemini-2.5-flash',
+  geminiModel: 'auto',
+  geminiLastGood: '',
   openaiBaseUrl: 'https://api.groq.com/openai/v1',
   openaiApiKey: '',
   openaiModel: 'llama-3.3-70b-versatile',
 
-  ttsProvider: 'elevenlabs',
+  ttsProvider: 'gemini',
   ttsTransport: 'edge',
   elevenApiKey: '',
   elevenVoiceId: 'JBFqnCBsd6RMkjVDRZzb',
   elevenModelId: 'eleven_multilingual_v2',
   googleTtsApiKey: '',
   googleTtsVoice: 'en-US-Neural2-D',
+  googlePitch: 0,
   speakingRate: 1,
+
+  geminiTtsVoice: 'Charon',
+  geminiTtsStyle: 'Narrate like a gripping YouTube manhwa recap storyteller, dramatic but clear, with natural pauses',
+  geminiTtsModel: 'auto',
+  geminiTtsLastGood: '',
+
+  elevenStability: 0.45,
+  elevenSimilarity: 0.8,
+  elevenStyle: 0,
+  elevenSpeakerBoost: true,
 
   lastProjectId: '',
 };
@@ -70,7 +95,16 @@ export const useSettings = create<SettingsState>()(
       update: (patch) => set(patch),
       reset: () => set({ ...DEFAULT_SETTINGS }),
     }),
-    { name: 'mrs-settings', storage: createJSONStorage(() => localStorage), version: 1 },
+    {
+      name: 'mrs-settings',
+      storage: createJSONStorage(() => localStorage),
+      version: 2,
+      // v2: auto model selection + free Gemini voices become the defaults.
+      migrate: (persisted, from) => {
+        const s = (persisted ?? {}) as Partial<Settings>;
+        return from < 2 ? { ...s, geminiModel: 'auto', ttsProvider: 'gemini' } : s;
+      },
+    },
   ),
 );
 
