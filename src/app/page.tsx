@@ -2,144 +2,305 @@
 
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
-import { CheckCircle2, Circle, Compass, ExternalLink, FileText, Film, HardDrive, Mic, Scissors } from 'lucide-react';
-import { DriveFile, listChildren } from '@/lib/drive';
-import { useSession } from '@/lib/store';
-import { cn, formatBytes, formatDate } from '@/lib/utils';
-import { Badge, Card, PageHeader } from '@/components/ui';
-import { RequireDrive } from '@/components/RequireProject';
+import { ArrowDown, ArrowUp, FolderOpen, Plus, Save, Sparkles, Trash2 } from 'lucide-react';
+import { DriveFile, downloadJson, isJson, saveJson, saveText } from '@/lib/drive';
+import { getPanelBlob } from '@/lib/panelCache';
+import { listOrderedPanels } from '@/lib/panels';
+import { Project, patchProject } from '@/lib/projects';
+import {
+  Beat,
+  LENGTH_PRESETS,
+  RecapScript,
+  ScriptRequest,
+  TONES,
+  blobToPromptImage,
+  estimateSeconds,
+  generateWithGemini,
+  generateWithOpenAI,
+  scriptToText,
+  totalSeconds,
+} from '@/lib/script';
+import { ScriptEngine, useSession, useSettings } from '@/lib/store';
+import { errorMessage, fileSlug, formatDuration, stamp } from '@/lib/utils';
+import { Badge, Button, Card, Field, Input, Notice, PageHeader, Select, Slider, Textarea, Toggle } from '@/components/ui';
+import RequireProject from '@/components/RequireProject';
+import DrivePicker from '@/components/DrivePicker';
 
-interface Stats {
-  source: number;
-  scripts: number;
-  panels: number;
-  audio: number;
-  exports: DriveFile[];
+export default function ScriptPage() {
+  return (
+    <div>
+      <PageHeader title="Recap script generator" description="Paste chapter text or a summary, choose length and tone, and get a numbered beat script ready for narration." />
+      <RequireProject>{(project) => <ScriptStudio key={project.id} project={project} />}</RequireProject>
+    </div>
+  );
 }
 
-export default function Dashboard() {
-  const project = useSession((s) => s.project);
-  const token = useSession((s) => s.token);
-  const [stats, setStats] = useState<Stats | null>(null);
+const MAX_IMAGES = 24;
 
+function ScriptStudio({ project }: { project: Project }) {
+  const settings = useSettings();
+  const script = useSession((s) => s.script);
+  const scriptFileId = useSession((s) => s.scriptFileId);
+  const setSession = useSession((s) => s.set);
+  const toast = useSession((s) => s.toast);
+
+  const [chapter, setChapter] = useState('');
+  const [sourceText, setSourceText] = useState('');
+  const [targetSeconds, setTargetSeconds] = useState(300);
+  const [tone, setTone] = useState(TONES[0]);
+  const [language, setLanguage] = useState('English');
+  const [includeOutro, setIncludeOutro] = useState(true);
+  const [useSynopsis, setUseSynopsis] = useState(true);
+  const [usePanels, setUsePanels] = useState(false);
+  const [engine, setEngine] = useState<ScriptEngine>(settings.scriptEngine);
+  const [panelFiles, setPanelFiles] = useState<DriveFile[]>([]);
+  const [generating, setGenerating] = useState(false);
+  const [stage, setStage] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+
+  // Load the project's panels (for the optional multimodal mode) and its active script.
   useEffect(() => {
-    if (!project || !token) {
-      setStats(null);
-      return;
-    }
     let alive = true;
-    const f = project.folders;
-    Promise.all([listChildren(f.source), listChildren(f.scripts), listChildren(f.panels), listChildren(f.audio), listChildren(f.exports, { orderBy: 'modifiedTime desc' })])
-      .then(([source, scripts, panels, audio, exports]) => {
-        if (alive)
-          setStats({
-            source: source.length,
-            scripts: scripts.filter((x) => x.name.endsWith('.json')).length,
-            panels: panels.length,
-            audio: audio.filter((x) => /\.(mp3|wav)$/i.test(x.name)).length,
-            exports,
-          });
-      })
-      .catch(() => alive && setStats(null));
+    listOrderedPanels(project)
+      .then((files) => alive && setPanelFiles(files))
+      .catch(() => undefined);
+    if (!useSession.getState().script && project.meta.activeScriptFileId) {
+      downloadJson<RecapScript>(project.meta.activeScriptFileId)
+        .then((s) => alive && s?.beats && setSession({ script: s, scriptFileId: project.meta.activeScriptFileId ?? null }))
+        .catch(() => undefined);
+    }
     return () => {
       alive = false;
     };
-  }, [project, token]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project.id]);
 
-  const steps = [
-    { href: '/discover', icon: Compass, title: 'Pick a series', desc: 'Browse trending manhwa and create a Drive project.', done: Boolean(project) },
-    { href: '/slicer', icon: Scissors, title: 'Slice panels', desc: 'Extract a .cbz/.zip and cut the strip into panels.', done: (stats?.panels ?? 0) > 0, count: stats?.panels },
-    { href: '/script', icon: FileText, title: 'Write the script', desc: 'Generate a beat-by-beat recap with Gemini.', done: (stats?.scripts ?? 0) > 0, count: stats?.scripts },
-    { href: '/voice', icon: Mic, title: 'Record narration', desc: 'Turn the script into a single narration MP3.', done: (stats?.audio ?? 0) > 0, count: stats?.audio },
-    { href: '/compose', icon: Film, title: 'Render video', desc: 'Ken Burns animation + narration → MP4 in Drive.', done: (stats?.exports.length ?? 0) > 0, count: stats?.exports.length },
-  ];
+  const generate = async () => {
+    setGenerating(true);
+    setError(null);
+    try {
+      let images: ScriptRequest['images'];
+      if (usePanels && engine === 'gemini' && panelFiles.length) {
+        // Evenly sample up to MAX_IMAGES panels across the chapter.
+        const step = Math.max(1, panelFiles.length / MAX_IMAGES);
+        const picks = Array.from({ length: Math.min(MAX_IMAGES, panelFiles.length) }, (_, i) => panelFiles[Math.floor(i * step)]);
+        images = [];
+        for (let i = 0; i < picks.length; i++) {
+          setStage(`Preparing panel ${i + 1}/${picks.length}…`);
+          images.push(await blobToPromptImage(await getPanelBlob(picks[i].id)));
+        }
+      }
+      if (!sourceText.trim() && !images?.length) throw new Error('Paste some chapter text/summary, or enable “Use sliced panels”.');
+      const req: ScriptRequest = {
+        series: project.meta.title || project.name,
+        synopsis: useSynopsis ? project.meta.synopsis : undefined,
+        chapter: chapter.trim() || undefined,
+        sourceText,
+        targetSeconds,
+        tone,
+        language,
+        includeOutro,
+        images,
+      };
+      setStage(`Writing with ${engine === 'gemini' ? settings.geminiModel : settings.openaiModel}…`);
+      const result =
+        engine === 'gemini'
+          ? await generateWithGemini(req, settings.geminiApiKey, settings.geminiModel, setStage)
+          : await generateWithOpenAI(req, settings.openaiBaseUrl, settings.openaiApiKey, settings.openaiModel);
+      setSession({ script: result, scriptFileId: null });
+      toast(`Script ready: ${result.beats.length} beats.`, 'success');
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setGenerating(false);
+      setStage('');
+    }
+  };
+
+  const updateScript = (patch: Partial<RecapScript>) => script && setSession({ script: { ...script, ...patch } });
+  const updateBeat = (i: number, patch: Partial<Beat>) =>
+    script && updateScript({ beats: script.beats.map((b, j) => (j === i ? { ...b, ...patch } : b)) });
+  const renumber = (beats: Beat[]) => beats.map((b, i) => ({ ...b, n: i + 1 }));
+  const moveBeat = (i: number, d: -1 | 1) => {
+    if (!script) return;
+    const beats = [...script.beats];
+    const j = i + d;
+    if (j < 0 || j >= beats.length) return;
+    [beats[i], beats[j]] = [beats[j], beats[i]];
+    updateScript({ beats: renumber(beats) });
+  };
+
+  const save = async () => {
+    if (!script) return;
+    setSaving(true);
+    try {
+      const cleaned: RecapScript = { ...script, beats: renumber(script.beats.filter((b) => b.narration.trim())).map((b) => ({ ...b, seconds: estimateSeconds(b.narration) })) };
+      const base = `script_${fileSlug(cleaned.chapter || cleaned.title)}_${stamp()}`;
+      // Keep saving into the same file once it exists; the .txt is a readable companion.
+      const jsonFile = await saveJson(project.folders.scripts, `${base}.json`, cleaned, scriptFileId ?? undefined);
+      await saveText(project.folders.scripts, jsonFile.name.replace(/\.json$/, '.txt'), scriptToText(cleaned));
+      setSession({ script: cleaned, scriptFileId: jsonFile.id });
+      await patchProject({ activeScriptFileId: jsonFile.id });
+      toast(`Saved ${jsonFile.name} to Drive › ${project.name} › Scripts`, 'success');
+    } catch (err) {
+      toast(errorMessage(err), 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const loadFromDrive = async (files: DriveFile[]) => {
+    const f = files[0];
+    if (!f) return;
+    try {
+      const s = await downloadJson<RecapScript>(f.id);
+      if (!Array.isArray(s?.beats)) throw new Error('That JSON file is not a recap script.');
+      setSession({ script: s, scriptFileId: f.id });
+      await patchProject({ activeScriptFileId: f.id });
+    } catch (err) {
+      toast(errorMessage(err), 'error');
+    }
+  };
+
+  const est = script ? totalSeconds(script) : 0;
+  const keyMissing = engine === 'gemini' ? !settings.geminiApiKey : !settings.openaiApiKey;
 
   return (
-    <div>
-      <PageHeader
-        title="Studio dashboard"
-        description="A fully serverless recap pipeline. Files live in your Google Drive; slicing, audio stitching and video rendering happen in this browser tab."
-      />
+    <div className="grid gap-4 xl:grid-cols-[380px_1fr]">
+      <div className="space-y-4">
+        <Card title="Source & options">
+          <div className="space-y-4">
+            <Field label="Chapter / arc label">
+              <Input value={chapter} onChange={(e) => setChapter(e.target.value)} placeholder="e.g. Chapters 1–12" />
+            </Field>
+            <Field label="Chapter summary or raw text" hint="Paste dialogue, a summary, or fan-translation text. The more detail, the better the recap.">
+              <Textarea rows={9} value={sourceText} onChange={(e) => setSourceText(e.target.value)} placeholder="Jin-woo enters the double dungeon…" />
+            </Field>
+            <Field label="Target video length">
+              <Select value={LENGTH_PRESETS.some((p) => p.seconds === targetSeconds) ? targetSeconds : 'custom'} onChange={(e) => e.target.value !== 'custom' && setTargetSeconds(Number(e.target.value))}>
+                {LENGTH_PRESETS.map((p) => (
+                  <option key={p.seconds} value={p.seconds}>
+                    {p.label}
+                  </option>
+                ))}
+                {!LENGTH_PRESETS.some((p) => p.seconds === targetSeconds) && <option value="custom">Custom</option>}
+              </Select>
+            </Field>
+            <Slider label="Fine-tune length" value={targetSeconds} min={30} max={1800} step={15} onChange={setTargetSeconds} format={formatDuration} />
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Tone">
+                <Select value={tone} onChange={(e) => setTone(e.target.value)}>
+                  {TONES.map((t) => (
+                    <option key={t}>{t}</option>
+                  ))}
+                </Select>
+              </Field>
+              <Field label="Language">
+                <Input value={language} onChange={(e) => setLanguage(e.target.value)} />
+              </Field>
+            </div>
+            <Field label="Engine">
+              <Select value={engine} onChange={(e) => setEngine(e.target.value as ScriptEngine)}>
+                <option value="gemini">Google Gemini ({settings.geminiModel})</option>
+                <option value="openai">OpenAI-compatible ({settings.openaiModel})</option>
+              </Select>
+            </Field>
+            <Toggle checked={useSynopsis} onChange={setUseSynopsis} label="Give the model the series synopsis" hint={project.meta.synopsis ? undefined : 'This project has no synopsis (create it from Discover to add one).'} />
+            <Toggle checked={includeOutro} onChange={setIncludeOutro} label="End with a like & subscribe outro" />
+            <Toggle
+              checked={usePanels}
+              onChange={setUsePanels}
+              label={`Use sliced panels as visual reference (${panelFiles.length})`}
+              hint={engine === 'gemini' ? `Gemini looks at up to ${MAX_IMAGES} panels to understand the chapter.` : 'Only available with Gemini.'}
+            />
+            {keyMissing && (
+              <Notice kind="warn">
+                No API key for this engine. Add one in <Link href="/settings" className="underline">Settings</Link>.
+              </Notice>
+            )}
+            {error && <Notice kind="error">{error}</Notice>}
+            <Button variant="primary" size="lg" className="w-full" loading={generating} onClick={generate} icon={<Sparkles className="size-4" />}>
+              {generating ? stage || 'Generating…' : 'Generate script'}
+            </Button>
+          </div>
+        </Card>
+      </div>
 
-      {project && (
-        <div className="relative mb-6 overflow-hidden rounded-2xl border border-zinc-800">
-          {project.meta.bannerImage && <img src={project.meta.bannerImage} alt="" className="absolute inset-0 size-full object-cover opacity-25" />}
-          <div className="relative flex gap-4 bg-gradient-to-r from-zinc-950 via-zinc-950/80 to-transparent p-5">
-            {project.meta.coverImage && <img src={project.meta.coverImage} alt="" className="h-32 w-22 shrink-0 rounded-xl object-cover shadow-xl" />}
-            <div className="min-w-0">
-              <div className="text-[11px] uppercase tracking-wider text-violet-300">Current project</div>
-              <h2 className="mt-1 text-lg font-semibold text-white">{project.name}</h2>
-              <div className="mt-2 flex flex-wrap gap-1.5">{project.meta.genres?.slice(0, 5).map((g) => <Badge key={g}>{g}</Badge>)}</div>
-              {project.meta.synopsis && <p className="mt-2 line-clamp-3 max-w-2xl text-sm text-zinc-400">{project.meta.synopsis}</p>}
+      <Card
+        title={script ? 'Script editor' : 'Script'}
+        subtitle={script ? `${script.beats.length} beats · est. ${formatDuration(est)} of narration · target ${formatDuration(script.targetSeconds)}` : 'Generate or open a script to edit it here.'}
+        actions={
+          <>
+            <Button size="sm" variant="ghost" icon={<FolderOpen className="size-3.5" />} onClick={() => setPickerOpen(true)}>
+              Open from Drive
+            </Button>
+            {script && (
+              <Button size="sm" variant="primary" loading={saving} onClick={save} icon={<Save className="size-3.5" />}>
+                Save to Drive
+              </Button>
+            )}
+          </>
+        }
+      >
+        {!script ? (
+          <p className="py-10 text-center text-sm text-zinc-500">Nothing here yet.</p>
+        ) : (
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <Input className="flex-1 text-base font-medium" value={script.title} onChange={(e) => updateScript({ title: e.target.value })} />
+              <Badge tone="accent">{script.tone}</Badge>
+              {scriptFileId ? <Badge tone="good">saved</Badge> : <Badge tone="warn">unsaved</Badge>}
+            </div>
+            <ol className="space-y-3">
+              {script.beats.map((b, i) => (
+                <li key={i} className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
+                  <div className="mb-2 flex items-center gap-2">
+                    <span className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-violet-600/20 font-mono text-xs text-violet-200">{b.n}</span>
+                    <Input className="h-8 flex-1 text-sm" value={b.title ?? ''} placeholder="Beat title" onChange={(e) => updateBeat(i, { title: e.target.value })} />
+                    <span className="w-12 text-right font-mono text-[11px] text-zinc-500">~{estimateSeconds(b.narration)}s</span>
+                    <button className="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-white" onClick={() => moveBeat(i, -1)} aria-label="Move up">
+                      <ArrowUp className="size-3.5" />
+                    </button>
+                    <button className="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-white" onClick={() => moveBeat(i, 1)} aria-label="Move down">
+                      <ArrowDown className="size-3.5" />
+                    </button>
+                    <button
+                      className="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-red-300"
+                      onClick={() => updateScript({ beats: renumber(script.beats.filter((_, j) => j !== i)) })}
+                      aria-label="Delete beat"
+                    >
+                      <Trash2 className="size-3.5" />
+                    </button>
+                  </div>
+                  <Textarea rows={3} value={b.narration} onChange={(e) => updateBeat(i, { narration: e.target.value })} />
+                  <Input className="mt-2 h-8 text-xs text-zinc-400" value={b.visual ?? ''} placeholder="Visual cue" onChange={(e) => updateBeat(i, { visual: e.target.value })} />
+                </li>
+              ))}
+            </ol>
+            <div className="flex flex-wrap gap-2">
+              <Button size="sm" icon={<Plus className="size-3.5" />} onClick={() => updateScript({ beats: renumber([...script.beats, { n: 0, narration: '', title: '' }]) })}>
+                Add beat
+              </Button>
+              <Link href="/voice">
+                <Button size="sm" variant="ghost">
+                  Next: generate voice →
+                </Button>
+              </Link>
             </div>
           </div>
-        </div>
-      )}
+        )}
+      </Card>
 
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
-        {steps.map((s, i) => (
-          <Link key={s.href} href={s.href} className="group rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4 transition hover:border-violet-500/50 hover:bg-zinc-900">
-            <div className="flex items-center justify-between">
-              <span className="flex size-9 items-center justify-center rounded-xl bg-violet-600/15 text-violet-300">
-                <s.icon className="size-4" />
-              </span>
-              {s.done ? <CheckCircle2 className="size-5 text-emerald-400" /> : <Circle className="size-5 text-zinc-700" />}
-            </div>
-            <div className="mt-3 text-[11px] text-zinc-500">Step {i + 1}</div>
-            <div className="font-medium text-zinc-100">{s.title}</div>
-            <p className="mt-1 text-xs text-zinc-400">{s.desc}</p>
-            {typeof s.count === 'number' && <div className="mt-2 text-[11px] text-zinc-500">{s.count} in Drive</div>}
-          </Link>
-        ))}
-      </div>
-
-      <div className="mt-6 grid gap-4 lg:grid-cols-2">
-        <Card title="Recent exports" subtitle="Final Exports folder of the current project">
-          <RequireDrive>
-            {!project ? (
-              <p className="text-sm text-zinc-500">Select a project to see its exports.</p>
-            ) : !stats?.exports.length ? (
-              <p className="text-sm text-zinc-500">No videos rendered yet.</p>
-            ) : (
-              <ul className="divide-y divide-zinc-800">
-                {stats.exports.slice(0, 6).map((f) => (
-                  <li key={f.id} className="flex items-center gap-3 py-2 text-sm">
-                    <Film className="size-4 text-rose-300" />
-                    <span className="min-w-0 flex-1 truncate">{f.name}</span>
-                    <span className="text-[11px] text-zinc-500">{formatBytes(f.size)}</span>
-                    <span className="hidden text-[11px] text-zinc-500 sm:inline">{formatDate(f.modifiedTime)}</span>
-                    {f.webViewLink && (
-                      <a href={f.webViewLink} target="_blank" rel="noreferrer" className="text-violet-300 hover:text-violet-200" aria-label="Open in Drive">
-                        <ExternalLink className="size-4" />
-                      </a>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </RequireDrive>
-        </Card>
-
-        <Card title="How it stays serverless">
-          <ul className="space-y-2 text-sm text-zinc-400">
-            {[
-              ['Storage', 'Google Drive API with OAuth 2.0 — project.json in each folder is the database.'],
-              ['Scripts', 'Google Gemini called straight from the browser with your free API key.'],
-              ['Slicing', 'JSZip + HTML5 canvas pixel analysis to find gutters.'],
-              ['Voice', 'ElevenLabs / Google TTS via a tiny edge function, stitched with Web Audio.'],
-              ['Video', 'Canvas Ken Burns frames encoded by FFmpeg.wasm (H.264 + AAC).'],
-            ].map(([k, v]) => (
-              <li key={k} className="flex gap-3">
-                <span className={cn('w-16 shrink-0 text-xs font-medium text-violet-300')}>{k}</span>
-                <span>{v}</span>
-              </li>
-            ))}
-          </ul>
-          <Link href="/drive" className="mt-4 inline-flex items-center gap-2 text-sm text-violet-300 hover:text-violet-200">
-            <HardDrive className="size-4" /> Open the Drive explorer
-          </Link>
-        </Card>
-      </div>
+      <DrivePicker
+        open={pickerOpen}
+        onClose={() => setPickerOpen(false)}
+        start={[{ id: project.folders.scripts, name: 'Scripts' }]}
+        title="Open a script"
+        accept={isJson}
+        onPick={loadFromDrive}
+      />
     </div>
   );
 }
