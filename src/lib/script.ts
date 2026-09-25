@@ -1,3 +1,5 @@
+import { getGemini, listAvailableModels, rankModels, withGeminiModel } from './gemini';
+
 /**
  * Recap script generation — two engines, both called straight from the browser:
  *   1. Google Gemini via @google/genai (free tier key from aistudio.google.com)
@@ -156,61 +158,68 @@ export function normalizeScript(raw: unknown, req: ScriptRequest, engine: string
   };
 }
 
-export async function generateWithGemini(req: ScriptRequest, apiKey: string, model: string): Promise<RecapScript> {
-  if (!apiKey) throw new Error('Add your Gemini API key on the Settings page (free at aistudio.google.com).');
-  const { GoogleGenAI, Type } = await import('@google/genai');
-  const ai = new GoogleGenAI({ apiKey });
+export async function generateWithGemini(
+  req: ScriptRequest,
+  apiKey: string,
+  model: string,
+  onStatus?: (message: string) => void,
+  onModel?: (model: string) => void,
+  lastGoodModel?: string,
+): Promise<RecapScript> {
+  const { ai, Type } = await getGemini(apiKey);
   const { system, user } = buildPrompt(req);
-
   const parts: Array<Record<string, unknown>> = [{ text: user }];
   for (const img of req.images ?? []) parts.push({ inlineData: { mimeType: img.mimeType, data: img.data } });
 
-  const response = await ai.models.generateContent({
-    model,
-    contents: [{ role: 'user', parts }],
-    config: {
-      systemInstruction: system,
-      temperature: 0.9,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          title: { type: Type.STRING },
-          beats: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                n: { type: Type.INTEGER },
-                title: { type: Type.STRING },
-                narration: { type: Type.STRING },
-                visual: { type: Type.STRING },
-                seconds: { type: Type.NUMBER },
+  // Tries your chosen model, then the last one that worked, then the best free-tier models your key has.
+  const { result, model: used } = await withGeminiModel(
+    apiKey,
+    'text',
+    [model, lastGoodModel],
+    async (m) => {
+      const response = await ai.models.generateContent({
+        model: m,
+        contents: [{ role: 'user', parts }],
+        config: {
+          systemInstruction: system,
+          temperature: 0.9,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              title: { type: Type.STRING },
+              beats: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    n: { type: Type.INTEGER },
+                    title: { type: Type.STRING },
+                    narration: { type: Type.STRING },
+                    visual: { type: Type.STRING },
+                    seconds: { type: Type.NUMBER },
+                  },
+                  required: ['n', 'narration'],
+                },
               },
-              required: ['n', 'narration'],
             },
+            required: ['title', 'beats'],
           },
         },
-        required: ['title', 'beats'],
-      },
+      });
+      const text = response.text;
+      if (!text) throw new Error('Gemini returned an empty response (it may have been blocked by safety filters).');
+      return normalizeScript(parseLooseJson(text), req, 'gemini', m);
     },
-  });
-  const text = response.text;
-  if (!text) throw new Error('Gemini returned an empty response (it may have been blocked by safety filters).');
-  return normalizeScript(parseLooseJson(text), req, 'gemini', model);
+    onStatus,
+  );
+  onModel?.(used);
+  return result;
 }
 
+/** Text models your key can use, best (free-tier friendly) first. */
 export async function listGeminiModels(apiKey: string): Promise<string[]> {
-  const { GoogleGenAI } = await import('@google/genai');
-  const ai = new GoogleGenAI({ apiKey });
-  const pager = await ai.models.list({ config: { pageSize: 100 } });
-  const names: string[] = [];
-  for await (const m of pager) {
-    const name = (m.name ?? '').replace(/^models\//, '');
-    const actions = (m as { supportedActions?: string[] }).supportedActions;
-    if (name.startsWith('gemini') && (!actions || actions.includes('generateContent'))) names.push(name);
-  }
-  return names.sort();
+  return rankModels(await listAvailableModels(apiKey), 'text');
 }
 
 export async function generateWithOpenAI(req: ScriptRequest, baseUrl: string, apiKey: string, model: string): Promise<RecapScript> {
